@@ -18,13 +18,23 @@ from nanochat.common import get_base_dir
 
 # -----------------------------------------------------------------------------
 # The specifics of the current pretraining dataset
+#
+# Switchable via NANOCHAT_DATASET env var. Default = "climbmix" (Karpathy's original).
+# Set NANOCHAT_DATASET=pre1985 to use the contamination-controlled pre-1985 corpus
+# built locally by scripts/build_pretrain_corpus.py.
 
-# The URL on the internet where the data is hosted and downloaded from on demand
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
+DATASET = os.environ.get("NANOCHAT_DATASET", "climbmix")
 base_dir = get_base_dir()
-DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
+
+if DATASET == "climbmix":
+    BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
+    MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
+    index_to_filename = lambda index: f"shard_{index:05d}.parquet"
+    DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
+elif DATASET == "pre1985":
+    from nanochat.dataset_pre1985 import BASE_URL, MAX_SHARD, index_to_filename, DATA_DIR
+else:
+    raise ValueError(f"Unknown NANOCHAT_DATASET={DATASET!r} (valid: 'climbmix', 'pre1985')")
 
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
@@ -138,6 +148,11 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--num-files", type=int, default=-1, help="Number of train shards to download (default: -1), -1 = disable")
     parser.add_argument("-w", "--num-workers", type=int, default=4, help="Number of parallel download workers (default: 4)")
     args = parser.parse_args()
+
+    if BASE_URL is None or MAX_SHARD is None:
+        print(f"NANOCHAT_DATASET={DATASET!r} is built locally; nothing to download.")
+        print(f"Run scripts/build_pretrain_corpus.py instead. Output dir: {DATA_DIR}")
+        raise SystemExit(0)
 
     # Prepare the output directory
     os.makedirs(DATA_DIR, exist_ok=True)

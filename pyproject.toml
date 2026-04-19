@@ -5,10 +5,15 @@ description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "aiosqlite>=0.20.0",
+    "anthropic[vertex]>=0.40.0",
     "datasets>=4.0.0",
     "fastapi>=0.117.1",
     "kernels>=0.11.7",
+    "lxml>=5.3.0",
+    "openai>=1.50.0",
     "psutil>=7.1.0",
+    "python-dotenv>=1.0.0",
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
