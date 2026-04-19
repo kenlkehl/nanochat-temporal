@@ -19,7 +19,8 @@ Project name "Fluttering Pebble" — embedded in the assistant persona (`knowled
 |---|---|
 | `nanochat/dataset_pre1985.py` | Pre-1985 dataset constants (pluggable into the existing dataloader). |
 | `nanochat/contamination_filter.py` | Async Claude-based pre-1985 contamination judge with prefilter + Haiku/Sonnet cascade + sqlite cache. |
-| `nanochat/sft_generator.py` | Async OpenAI-compatible local-LLM client for bulk SFT data generation. |
+| `nanochat/sft_generator.py` | Async OpenAI-compatible local-LLM client for bulk SFT data generation; load-balances across a pool of endpoints. |
+| `nanochat/vllm_launcher.py` | Subprocess lifecycle for a pool of vLLM servers (one per GPU); used by the generator scripts' `--vllm-auto-launch` mode. |
 | `scripts/build_pretrain_corpus.py` | Streams pre-1929 books from HF + pre-1985 PubMed XML from NLM into ClimbMix-format parquet shards (idempotent, resumable). |
 | `scripts/build_sft_data.py` | Async orchestrator for synthetic SFT generation (categories: grounded Q&A, code, tool-use, comprehension); each candidate is contamination-filtered. |
 | `scripts/chat_sft_pre1985.py` | Fork of `scripts/chat_sft.py` with the data mixture replaced (drops SmolTalk/MMLU/ARC, keeps GSM8K/SpellingBee/SimpleSpelling, adds our generated JSONLs). |
@@ -41,7 +42,7 @@ Project name "Fluttering Pebble" — embedded in the assistant persona (`knowled
 
 1. An 8×H100 (or similar) GPU node — same as upstream nanochat.
 2. Anthropic Claude access for the contamination filter — **either** the public Anthropic API (set `ANTHROPIC_API_KEY`) **or** Google Cloud Vertex AI (set `ANTHROPIC_BACKEND=vertex` plus standard Google ADC and `ANTHROPIC_VERTEX_PROJECT_ID` / `ANTHROPIC_VERTEX_REGION`). Budget ~$60–100 for filtering ~50K SFT candidates (Haiku 4.5 default, Sonnet 4.6 ~10% escalation).
-3. A local OpenAI-compatible LLM endpoint (vLLM, SGLang, llama.cpp server, etc.) for bulk SFT generation. Recommended models (none pinned): Qwen3-32B-Instruct, Llama-3.3-70B-Instruct, DeepSeek-V3, or Llama-3.1-8B-Instruct for speed.
+3. A local OpenAI-compatible LLM endpoint (vLLM, SGLang, llama.cpp server, etc.) for bulk SFT generation. Recommended models (none pinned): Qwen3-32B-Instruct, Llama-3.3-70B-Instruct, DeepSeek-V3, or Llama-3.1-8B-Instruct for speed. On multi-GPU boxes you can run one vLLM per GPU and the pipeline will load-balance across them; the speedrun can also auto-launch them for you (see "Running vLLM on multiple GPUs" below).
 
 **Install:**
 
@@ -55,20 +56,22 @@ source .venv/bin/activate
 ```bash
 # --- Anthropic backend (pick one) ---
 # Option A: public Anthropic API
-export ANTHROPIC_API_KEY=sk-ant-...
+#export ANTHROPIC_API_KEY=sk-ant-...
 
 # Option B: Google Vertex AI
-# export ANTHROPIC_BACKEND=vertex
-# export ANTHROPIC_VERTEX_PROJECT_ID=my-gcp-project
-# export ANTHROPIC_VERTEX_REGION=us-east5
+export ANTHROPIC_BACKEND=vertex
+export ANTHROPIC_VERTEX_PROJECT_ID=profile-notes
+export ANTHROPIC_VERTEX_REGION=global
 # (auth via gcloud auth application-default login or GOOGLE_APPLICATION_CREDENTIALS)
 # Optionally override model IDs if your Vertex deployment uses different ones:
 # export ANTHROPIC_HAIKU_MODEL=claude-haiku-4-5@20251001
 # export ANTHROPIC_SONNET_MODEL=claude-sonnet-4-6
 
 # --- Local LLM for bulk SFT generation ---
-export OPENAI_BASE_URL=http://localhost:8000/v1   # your local LLM endpoint
-export LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct    # whatever your server hosts
+export OPENAI_BASE_URL=http://localhost:8000/v1   # single endpoint
+# OR, for load-balancing across a pool of already-running vLLM servers:
+# export OPENAI_BASE_URLS=http://localhost:8000/v1,http://localhost:8001/v1,http://localhost:8002/v1,http://localhost:8003/v1
+export LOCAL_LLM_MODEL=google/gemma-4-31b-it  # whatever your server hosts
 
 # --- Run config ---
 export DEPTH=24                                   # model depth (override as desired)
@@ -86,6 +89,51 @@ Every step in the speedrun is **idempotent and resumable** — kill at any point
 5. Generate bulk SFT data (local-LLM hours; Claude filter ~$60–100).
 6. SFT.
 
+### Running vLLM on multiple GPUs
+
+Stages 4 and 5 are the bottleneck on multi-GPU boxes when only one vLLM server is running. The pipeline can drive a pool of servers (one per GPU) with round-robin load-balancing and independent per-server concurrency, and can optionally launch/tear down that pool itself.
+
+**Zero-config auto-launch from the speedrun** (easiest — one vLLM per listed GPU, started at the top of each generator stage and torn down on exit):
+
+```bash
+export VLLM_AUTO_LAUNCH=1
+export VLLM_MODEL=Qwen/Qwen3-32B-Instruct       # falls back to $LOCAL_LLM_MODEL
+export VLLM_GPUS="0,1,2,3"                       # supports "0-3" ranges too
+export VLLM_PER_SERVER_WORKERS=16                # in-flight requests per server
+# Optional passthrough to `vllm serve`:
+export VLLM_EXTRA_ARGS="--max-model-len 8192 --gpu-memory-utilization 0.9"
+bash runs/speedrun_pre1985.sh
+```
+
+Logs land in `$NANOCHAT_BASE_DIR/vllm_logs/vllm_gpu{id}_port{port}.log`. `vllm` must be installed in the active venv (`uv pip install vllm`).
+
+**Calling the generators directly with auto-launch:**
+
+```bash
+python -m dev.gen_identity_pre1985 --num 200 \
+    --vllm-auto-launch --vllm-gpus 0,1,2,3 --per-server-workers 8
+
+python -m scripts.build_sft_data \
+    --grounded-qa 20000 --code 10000 --tool-use 5000 --comprehension 5000 \
+    --vllm-auto-launch --vllm-gpus 0,1,2,3 --per-server-workers 16
+```
+
+Generator CLI args: `--vllm-auto-launch`, `--vllm-model`, `--vllm-gpus`, `--vllm-start-port` (default 8000), `--vllm-extra-args`, `--vllm-startup-timeout` (default 600s), `--per-server-workers`.
+
+**Manual pool (share one set of servers across both stages to avoid paying the model-load cost twice):**
+
+```bash
+# In one shell, start the pool and keep it running:
+python -m nanochat.vllm_launcher --model $LOCAL_LLM_MODEL --gpus 0,1,2,3
+# It will print the exact OPENAI_BASE_URLS line to export.
+
+# In another shell:
+export OPENAI_BASE_URLS=http://127.0.0.1:8000/v1,http://127.0.0.1:8001/v1,http://127.0.0.1:8002/v1,http://127.0.0.1:8003/v1
+bash runs/speedrun_pre1985.sh     # (with VLLM_AUTO_LAUNCH unset)
+```
+
+With auto-launch, the pool lives only for the duration of a single script — so the speedrun loads the model twice (once for stage 4, once for stage 5). For a 32B model on H100s that's a few minutes of overhead; cheap relative to generation time but worth the manual-pool workaround if you care.
+
 **Talk to the model:**
 
 ```bash
@@ -101,7 +149,7 @@ Sanity-check prompts to verify the cutoff is working:
 - "Write a Python function to compute the median of a list" → should write modern Python
 - "What did Mendel discover?" → should answer
 
-**Tuning:** override category counts via env vars (`GROUNDED_QA_N`, `CODE_N`, `TOOL_USE_N`, `COMPREHENSION_N`) or run any single stage of the speedrun directly.
+**Tuning:** override category counts via env vars (`GROUNDED_QA_N`, `CODE_N`, `TOOL_USE_N`, `COMPREHENSION_N`), adjust the vLLM pool via `VLLM_AUTO_LAUNCH` / `VLLM_GPUS` / `VLLM_PER_SERVER_WORKERS` / `VLLM_EXTRA_ARGS` (see "Running vLLM on multiple GPUs"), or run any single stage of the speedrun directly.
 
 ## Risks / caveats
 

@@ -12,11 +12,17 @@ Output JSONL has one conversation per line in the format expected by tasks/custo
 
 Requires:
     OPENAI_BASE_URL=http://localhost:8000/v1   (or wherever the local LLM is served)
+      -or-
+    OPENAI_BASE_URLS=http://h0:8000/v1,http://h0:8001/v1,...   (round-robin pool)
     LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct    (or whatever model the server hosts)
     ANTHROPIC_API_KEY=sk-ant-...                (for the contamination filter)
 
-Usage:
+Usage (single server):
     python -m dev.gen_identity_pre1985 --num 200 --workers 8
+
+Usage (auto-launch one vLLM per GPU):
+    python -m dev.gen_identity_pre1985 --num 200 \
+        --vllm-auto-launch --vllm-gpus 0,1,2,3 --per-server-workers 8
 """
 
 from __future__ import annotations
@@ -26,12 +32,15 @@ import json
 import random
 import asyncio
 import argparse
+import shlex
+from typing import Optional
 
 from dotenv import load_dotenv
 
 from nanochat.common import get_base_dir
 from nanochat.sft_generator import LocalLLM
 from nanochat.contamination_filter import ContaminationFilter
+from nanochat.vllm_launcher import VLLMPool, parse_gpu_ids_arg
 
 load_dotenv()
 
@@ -219,50 +228,112 @@ async def main_async(args):
         raise SystemExit(f"Knowledge file not found: {KNOWLEDGE_PATH}")
     knowledge = open(KNOWLEDGE_PATH, "r", encoding="utf-8").read().strip()
 
-    llm = LocalLLM(max_concurrency=args.workers)
-    cf = ContaminationFilter(max_concurrency=args.workers)
+    pool: Optional[VLLMPool] = None
+    if args.vllm_auto_launch:
+        model = args.vllm_model or os.environ.get("LOCAL_LLM_MODEL")
+        if not model:
+            raise SystemExit("--vllm-auto-launch requires --vllm-model or LOCAL_LLM_MODEL to be set.")
+        gpu_ids = parse_gpu_ids_arg(args.vllm_gpus)
+        if not gpu_ids:
+            raise SystemExit("--vllm-auto-launch requires --vllm-gpus (e.g. '0,1,2,3').")
+        pool = VLLMPool(
+            model=model,
+            gpu_ids=gpu_ids,
+            start_port=args.vllm_start_port,
+            extra_args=shlex.split(args.vllm_extra_args or ""),
+            startup_timeout=args.vllm_startup_timeout,
+        )
+        pool.start()
+        base_urls = pool.base_urls
+        print(f"[gen_identity_pre1985] auto-launched {len(base_urls)} vLLM server(s): {base_urls}")
+    else:
+        base_urls = None
 
-    out_path = args.output or os.path.join(get_base_dir(), "sft_data_pre1985", "identity_pre1985.jsonl")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    if not args.append and os.path.exists(out_path):
-        os.remove(out_path)
-    print(f"Output: {out_path}")
-    print(f"Topics: {list(TOPICS.keys())}")
-    print(f"Personas: {len(PERSONAS)}  Dynamics: {len(DYNAMICS)}\n")
+    per_server = args.per_server_workers or args.workers
+    try:
+        llm = LocalLLM(
+            base_urls=base_urls,
+            model=(args.vllm_model or None),
+            max_concurrency=per_server,
+        )
+        effective_workers = max(args.workers, llm.num_backends * per_server)
+        if effective_workers != args.workers:
+            print(
+                f"[gen_identity_pre1985] raising top-level workers {args.workers} -> "
+                f"{effective_workers} to saturate {llm.num_backends} backend(s) "
+                f"at {per_server} req/server."
+            )
+        cf = ContaminationFilter(max_concurrency=effective_workers)
 
-    sem = asyncio.Semaphore(args.workers)
-    out_lock = asyncio.Lock()
-    counters = {"accepted": 0, "rejected": 0, "errors": 0}
+        out_path = args.output or os.path.join(get_base_dir(), "sft_data_pre1985", "identity_pre1985.jsonl")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        if not args.append and os.path.exists(out_path):
+            os.remove(out_path)
+        print(f"Output: {out_path}")
+        print(f"Topics: {list(TOPICS.keys())}")
+        print(f"Personas: {len(PERSONAS)}  Dynamics: {len(DYNAMICS)}")
+        print(
+            f"LocalLLM: {llm.num_backends} backend(s), {per_server} req/server; "
+            f"top-level workers={effective_workers}\n"
+        )
 
-    async def worker(idx):
-        async with sem:
-            messages, err, div = await generate_one(idx, knowledge, llm, cf)
-        async with out_lock:
-            if messages is not None:
-                with open(out_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(messages) + "\n")
-                counters["accepted"] += 1
-                tag = "OK"
-            elif err and err.startswith(("generation", "filter")):
-                counters["errors"] += 1
-                tag = "ERR"
-            else:
-                counters["rejected"] += 1
-                tag = "DROP"
-            done = counters["accepted"] + counters["rejected"] + counters["errors"]
-            print(f"[{done}/{args.num}] {tag:4s} cat={div['category']:20s} {(err or div['topic'])[:80]}")
+        sem = asyncio.Semaphore(effective_workers)
+        out_lock = asyncio.Lock()
+        counters = {"accepted": 0, "rejected": 0, "errors": 0}
 
-    await asyncio.gather(*(worker(i) for i in range(args.num)))
-    await cf.close()
-    print(f"\nDone. accepted={counters['accepted']} rejected={counters['rejected']} errors={counters['errors']}")
+        async def worker(idx):
+            async with sem:
+                messages, err, div = await generate_one(idx, knowledge, llm, cf)
+            async with out_lock:
+                if messages is not None:
+                    with open(out_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(messages) + "\n")
+                    counters["accepted"] += 1
+                    tag = "OK"
+                elif err and err.startswith(("generation", "filter")):
+                    counters["errors"] += 1
+                    tag = "ERR"
+                else:
+                    counters["rejected"] += 1
+                    tag = "DROP"
+                done = counters["accepted"] + counters["rejected"] + counters["errors"]
+                print(f"[{done}/{args.num}] {tag:4s} cat={div['category']:20s} {(err or div['topic'])[:80]}")
+
+        await asyncio.gather(*(worker(i) for i in range(args.num)))
+        await cf.close()
+        await llm.close()
+        print(f"\nDone. accepted={counters['accepted']} rejected={counters['rejected']} errors={counters['errors']}")
+    finally:
+        if pool is not None:
+            pool.stop()
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num", type=int, default=200)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Top-level concurrency (also bounds ContaminationFilter). "
+                             "Auto-raised to num_backends * per_server_workers when smaller.")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--append", action="store_true")
+
+    # vLLM pool / auto-launch options (all optional; single-URL env path still works).
+    parser.add_argument("--vllm-auto-launch", action="store_true",
+                        help="Start a pool of vLLM servers (one per GPU) for the duration of this run.")
+    parser.add_argument("--vllm-model", type=str, default=os.environ.get("LOCAL_LLM_MODEL"),
+                        help="Model served by vLLM and used by LocalLLM. Defaults to $LOCAL_LLM_MODEL.")
+    parser.add_argument("--vllm-gpus", type=str, default=os.environ.get("VLLM_GPUS", "0"),
+                        help='GPU ids, e.g. "0,1,2,3" or "0-3". One vLLM server per GPU.')
+    parser.add_argument("--vllm-start-port", type=int,
+                        default=int(os.environ.get("VLLM_START_PORT", 8000)),
+                        help="First port; each subsequent server gets start_port+i.")
+    parser.add_argument("--vllm-extra-args", type=str,
+                        default=os.environ.get("VLLM_EXTRA_ARGS", ""),
+                        help='Extra args forwarded to `vllm serve`, e.g. "--max-model-len 8192".')
+    parser.add_argument("--vllm-startup-timeout", type=float, default=600.0,
+                        help="Seconds to wait for /v1/models to respond on each vLLM server.")
+    parser.add_argument("--per-server-workers", type=int, default=None,
+                        help="In-flight requests per vLLM server. Falls back to --workers when unset.")
     args = parser.parse_args()
     asyncio.run(main_async(args))
 

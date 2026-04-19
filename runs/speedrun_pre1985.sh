@@ -19,7 +19,18 @@
 #
 # Local LLM for bulk SFT generation:
 #   OPENAI_BASE_URL    — local OpenAI-compatible LLM endpoint (e.g. http://localhost:8000/v1)
+#   OPENAI_BASE_URLS   — comma-separated pool for load-balanced generation, e.g.
+#                        http://localhost:8000/v1,http://localhost:8001/v1,...
+#                        (use this when vLLM is already running on multiple ports)
 #   LOCAL_LLM_MODEL    — model name the local server exposes (e.g. Qwen/Qwen3-32B-Instruct)
+#
+# Optional vLLM auto-launch (one server per GPU, spun up per generator stage):
+#   VLLM_AUTO_LAUNCH=1                       enable auto-launch (default 0)
+#   VLLM_MODEL=Qwen/Qwen3-32B-Instruct       model to serve (falls back to LOCAL_LLM_MODEL)
+#   VLLM_GPUS="0,1,2,3"                      GPU ids; one vLLM server per GPU
+#   VLLM_START_PORT=8000                     first port; each GPU gets start_port+i
+#   VLLM_EXTRA_ARGS="--max-model-len 8192"   passthrough flags to `vllm serve`
+#   VLLM_PER_SERVER_WORKERS=16               in-flight requests per server
 #
 # Optional environment:
 #   DEPTH              — model depth (default 24); pick smaller if you have less compute
@@ -51,6 +62,24 @@ TOOL_USE_N="${TOOL_USE_N:-5000}"
 COMPREHENSION_N="${COMPREHENSION_N:-5000}"
 TARGET_TOKENS="${TARGET_TOKENS:-30000000000}"
 
+VLLM_AUTO_LAUNCH="${VLLM_AUTO_LAUNCH:-0}"
+VLLM_MODEL="${VLLM_MODEL:-${LOCAL_LLM_MODEL:-Qwen/Qwen3-32B-Instruct}}"
+VLLM_GPUS="${VLLM_GPUS:-0}"
+VLLM_START_PORT="${VLLM_START_PORT:-8000}"
+VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
+VLLM_PER_SERVER_WORKERS="${VLLM_PER_SERVER_WORKERS:-16}"
+
+VLLM_ARGS=()
+if [ "$VLLM_AUTO_LAUNCH" = "1" ]; then
+    VLLM_ARGS=(--vllm-auto-launch
+               --vllm-model "$VLLM_MODEL"
+               --vllm-gpus "$VLLM_GPUS"
+               --vllm-start-port "$VLLM_START_PORT"
+               --vllm-extra-args "$VLLM_EXTRA_ARGS"
+               --per-server-workers "$VLLM_PER_SERVER_WORKERS")
+    echo "vLLM auto-launch: model=$VLLM_MODEL gpus=$VLLM_GPUS start_port=$VLLM_START_PORT per_server_workers=$VLLM_PER_SERVER_WORKERS"
+fi
+
 if [ "${ANTHROPIC_BACKEND:-api}" = "vertex" ]; then
     if [ -z "$ANTHROPIC_VERTEX_PROJECT_ID" ]; then
         echo "ERROR: ANTHROPIC_BACKEND=vertex requires ANTHROPIC_VERTEX_PROJECT_ID."
@@ -63,8 +92,9 @@ elif [ -z "$ANTHROPIC_API_KEY" ]; then
 else
     echo "Anthropic backend: public API"
 fi
-if [ -z "$OPENAI_BASE_URL" ]; then
-    echo "WARNING: OPENAI_BASE_URL is not set. SFT data generation will use http://localhost:8000/v1"
+if [ "$VLLM_AUTO_LAUNCH" != "1" ] && [ -z "$OPENAI_BASE_URL" ] && [ -z "$OPENAI_BASE_URLS" ]; then
+    echo "WARNING: VLLM_AUTO_LAUNCH is unset/0 and neither OPENAI_BASE_URL nor OPENAI_BASE_URLS is set."
+    echo "         SFT data generation will default to http://localhost:8000/v1."
 fi
 
 python -m nanochat.report reset
@@ -104,7 +134,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-
 echo "=========================================================================="
 echo "4) Generating identity conversations"
 echo "=========================================================================="
-python -m dev.gen_identity_pre1985 --num=200 --workers=8
+python -m dev.gen_identity_pre1985 --num=200 --workers=8 "${VLLM_ARGS[@]}"
 
 # -----------------------------------------------------------------------------
 # 5) Generate bulk SFT data (local LLM, ~hours; Claude filter ~\$60-100, resumable)
@@ -116,7 +146,8 @@ python -m scripts.build_sft_data \
     --code "$CODE_N" \
     --tool-use "$TOOL_USE_N" \
     --comprehension "$COMPREHENSION_N" \
-    --workers 16
+    --workers 16 \
+    "${VLLM_ARGS[@]}"
 
 # -----------------------------------------------------------------------------
 # 6) SFT

@@ -22,13 +22,25 @@ Output JSONL formats:
   - grounded_qa, code, comprehension: plain-string content → tasks/customjson.py
   - tool_use:                         list-of-parts content → tasks/customjson_with_parts.py
 
-Usage:
+Usage (single vLLM server, as before):
     OPENAI_BASE_URL=http://localhost:8000/v1 \\
     LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct \\
     ANTHROPIC_API_KEY=sk-ant-... \\
     python -m scripts.build_sft_data \\
         --grounded-qa 20000 --code 10000 --tool-use 5000 --comprehension 5000 \\
         --workers 16
+
+Usage (auto-launch one vLLM server per GPU):
+    LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct \\
+    ANTHROPIC_API_KEY=sk-ant-... \\
+    python -m scripts.build_sft_data \\
+        --grounded-qa 20000 --code 10000 --tool-use 5000 --comprehension 5000 \\
+        --vllm-auto-launch --vllm-gpus 0,1,2,3 --per-server-workers 16
+
+Usage (pool already running on multiple ports):
+    OPENAI_BASE_URLS=http://localhost:8000/v1,http://localhost:8001/v1 \\
+    LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct \\
+    python -m scripts.build_sft_data ... --per-server-workers 16
 """
 
 from __future__ import annotations
@@ -38,6 +50,7 @@ import json
 import random
 import asyncio
 import argparse
+import shlex
 from typing import Optional
 
 import pyarrow.parquet as pq
@@ -47,6 +60,7 @@ from nanochat.common import get_base_dir
 from nanochat.dataset_pre1985 import DATA_DIR
 from nanochat.sft_generator import LocalLLM
 from nanochat.contamination_filter import ContaminationFilter
+from nanochat.vllm_launcher import VLLMPool, parse_gpu_ids_arg
 
 load_dotenv()
 
@@ -437,34 +451,76 @@ async def main_async(args):
     if not sampler._list_shards():
         print(f"[warn] no parquet shards found in {args.shards_dir}; grounded_qa and comprehension will skip.")
 
-    llm = LocalLLM(max_concurrency=args.workers)
-    cf = ContaminationFilter(max_concurrency=args.workers)
+    pool: Optional[VLLMPool] = None
+    if args.vllm_auto_launch:
+        model = args.vllm_model or os.environ.get("LOCAL_LLM_MODEL")
+        if not model:
+            raise SystemExit("--vllm-auto-launch requires --vllm-model or LOCAL_LLM_MODEL to be set.")
+        gpu_ids = parse_gpu_ids_arg(args.vllm_gpus)
+        if not gpu_ids:
+            raise SystemExit("--vllm-auto-launch requires --vllm-gpus (e.g. '0,1,2,3').")
+        pool = VLLMPool(
+            model=model,
+            gpu_ids=gpu_ids,
+            start_port=args.vllm_start_port,
+            extra_args=shlex.split(args.vllm_extra_args or ""),
+            startup_timeout=args.vllm_startup_timeout,
+        )
+        pool.start()
+        base_urls = pool.base_urls
+        print(f"[build_sft_data] auto-launched {len(base_urls)} vLLM server(s): {base_urls}")
+    else:
+        base_urls = None
 
-    targets = {
-        "grounded_qa":  args.grounded_qa,
-        "code":         args.code,
-        "tool_use":     args.tool_use,
-        "comprehension": args.comprehension,
-    }
-    print(f"Output dir: {out_dir}")
-    print(f"Targets:    {targets}")
+    per_server = args.per_server_workers or args.workers
+    try:
+        llm = LocalLLM(
+            base_urls=base_urls,
+            model=(args.vllm_model or None),
+            max_concurrency=per_server,
+        )
+        effective_workers = max(args.workers, llm.num_backends * per_server)
+        if effective_workers != args.workers:
+            print(
+                f"[build_sft_data] raising top-level workers {args.workers} -> "
+                f"{effective_workers} to saturate {llm.num_backends} backend(s) "
+                f"at {per_server} req/server."
+            )
+        cf = ContaminationFilter(max_concurrency=effective_workers)
 
-    base_offsets = {}
-    offset = 0
-    for cat in CATEGORY_REGISTRY.keys():
-        base_offsets[cat] = offset
-        offset += targets.get(cat, 0)
-
-    for category, target in targets.items():
-        if target <= 0:
-            continue
-        await run_category(
-            category, target, out_dir, sampler, llm, cf,
-            workers=args.workers, base_idx_offset=base_offsets[category],
+        targets = {
+            "grounded_qa":  args.grounded_qa,
+            "code":         args.code,
+            "tool_use":     args.tool_use,
+            "comprehension": args.comprehension,
+        }
+        print(f"Output dir: {out_dir}")
+        print(f"Targets:    {targets}")
+        print(
+            f"LocalLLM:   {llm.num_backends} backend(s), {per_server} req/server; "
+            f"top-level workers={effective_workers}"
         )
 
-    await cf.close()
-    print("\nAll categories done.")
+        base_offsets = {}
+        offset = 0
+        for cat in CATEGORY_REGISTRY.keys():
+            base_offsets[cat] = offset
+            offset += targets.get(cat, 0)
+
+        for category, target in targets.items():
+            if target <= 0:
+                continue
+            await run_category(
+                category, target, out_dir, sampler, llm, cf,
+                workers=effective_workers, base_idx_offset=base_offsets[category],
+            )
+
+        await cf.close()
+        await llm.close()
+        print("\nAll categories done.")
+    finally:
+        if pool is not None:
+            pool.stop()
 
 
 def main():
@@ -478,8 +534,28 @@ def main():
     parser.add_argument("--code", type=int, default=10000)
     parser.add_argument("--tool-use", type=int, default=5000)
     parser.add_argument("--comprehension", type=int, default=5000)
-    parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--workers", type=int, default=16,
+                        help="Top-level concurrency (also bounds ContaminationFilter). "
+                             "Auto-raised to num_backends * per_server_workers when smaller.")
     parser.add_argument("--seed", type=int, default=42)
+
+    # vLLM pool / auto-launch options (all optional; single-URL env path still works).
+    parser.add_argument("--vllm-auto-launch", action="store_true",
+                        help="Start a pool of vLLM servers (one per GPU) for the duration of this run.")
+    parser.add_argument("--vllm-model", type=str, default=os.environ.get("LOCAL_LLM_MODEL"),
+                        help="Model served by vLLM and used by LocalLLM. Defaults to $LOCAL_LLM_MODEL.")
+    parser.add_argument("--vllm-gpus", type=str, default=os.environ.get("VLLM_GPUS", "0"),
+                        help='GPU ids, e.g. "0,1,2,3" or "0-3". One vLLM server per GPU.')
+    parser.add_argument("--vllm-start-port", type=int,
+                        default=int(os.environ.get("VLLM_START_PORT", 8000)),
+                        help="First port; each subsequent server gets start_port+i.")
+    parser.add_argument("--vllm-extra-args", type=str,
+                        default=os.environ.get("VLLM_EXTRA_ARGS", ""),
+                        help='Extra args forwarded to `vllm serve`, e.g. "--max-model-len 8192".')
+    parser.add_argument("--vllm-startup-timeout", type=float, default=600.0,
+                        help="Seconds to wait for /v1/models to respond on each vLLM server.")
+    parser.add_argument("--per-server-workers", type=int, default=None,
+                        help="In-flight requests per vLLM server. Falls back to --workers when unset.")
     args = parser.parse_args()
     asyncio.run(main_async(args))
 
