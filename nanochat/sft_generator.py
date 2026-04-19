@@ -9,6 +9,8 @@ pass to LocalLLM(...) explicitly:
     OPENAI_BASE_URLS=http://h0:8000/v1,http://h0:8001/v1,...  # pool (comma-separated)
     OPENAI_API_KEY=EMPTY                        # whatever the local server expects
     LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct     # model name the server exposes
+    LOCAL_LLM_ENABLE_THINKING=1                 # forward chat_template_kwargs={"enable_thinking": True}
+                                                # (needed for Gemma-4 / Qwen3 thinking mode)
 
 If `OPENAI_BASE_URLS` is set (or a list is passed to `LocalLLM(base_urls=...)`),
 requests are load-balanced round-robin across the listed endpoints, with an
@@ -38,6 +40,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 import json
 import asyncio
 import itertools
@@ -45,6 +48,44 @@ from typing import Optional
 
 import openai
 from openai import AsyncOpenAI
+
+
+def _env_truthy(name: str) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+# Compiled once. Handles both the common `<think>...</think>` convention and
+# Gemma-4's `<start_of_thinking>...<end_of_thinking>` style. Used as a fallback
+# when vLLM's reasoning parser is not enabled server-side.
+_THINK_PATTERNS = [
+    re.compile(r"(?s)<think>.*?</think>\s*"),
+    re.compile(r"(?s)<start_of_thinking>.*?<end_of_thinking>\s*"),
+]
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove thinking preamble from a model response.
+
+    Tries vLLM's gemma4_utils.parse_thinking_output first (if importable), falls
+    back to regex for common delimiters. Safe no-op when no delimiters are
+    present (e.g. when the vLLM server already has --reasoning-parser enabled,
+    which moves thinking into a separate `reasoning_content` field).
+    """
+    if not text:
+        return text
+    try:
+        from vllm.reasoning.gemma4_utils import parse_thinking_output  # type: ignore
+        parsed = parse_thinking_output(text)
+        content = parsed.get("content") if isinstance(parsed, dict) else None
+        if content is not None:
+            return content.strip()
+    except Exception:
+        pass
+    out = text
+    for pat in _THINK_PATTERNS:
+        out = pat.sub("", out)
+    return out.strip()
 
 
 def _resolve_base_urls(
@@ -71,12 +112,21 @@ class LocalLLM:
         model: Optional[str] = None,
         max_concurrency: int = 16,
         timeout: float = 120.0,
+        enable_thinking: Optional[bool] = None,
     ):
         self.base_urls = _resolve_base_urls(base_urls, base_url)
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "EMPTY")
         self.model = model or os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen3-32B-Instruct")
         self.max_concurrency = max_concurrency
         self.timeout = timeout
+        # enable_thinking: when True, pass chat_template_kwargs={"enable_thinking": True}
+        # as extra_body to the OpenAI chat-completions call. vLLM forwards it to
+        # tokenizer.apply_chat_template() server-side. Required for Gemma-4
+        # reasoning and Qwen3 thinking mode. Auto-enabled via env
+        # LOCAL_LLM_ENABLE_THINKING=1.
+        if enable_thinking is None:
+            enable_thinking = _env_truthy("LOCAL_LLM_ENABLE_THINKING")
+        self.enable_thinking = bool(enable_thinking)
         self._clients: list[AsyncOpenAI] = [
             AsyncOpenAI(base_url=u, api_key=self.api_key, timeout=timeout)
             for u in self.base_urls
@@ -122,8 +172,18 @@ class LocalLLM:
                     )
                     if response_format is not None:
                         kwargs["response_format"] = response_format
+                    if self.enable_thinking:
+                        # vLLM forwards chat_template_kwargs through to
+                        # tokenizer.apply_chat_template(); openai SDK hides any
+                        # non-standard keys in `extra_body`.
+                        kwargs["extra_body"] = {
+                            "chat_template_kwargs": {"enable_thinking": True}
+                        }
                     response = await client.chat.completions.create(**kwargs)
-                return response.choices[0].message.content or ""
+                content = response.choices[0].message.content or ""
+                if self.enable_thinking:
+                    content = _strip_thinking(content)
+                return content
             except (
                 openai.APIConnectionError,
                 openai.APIStatusError,

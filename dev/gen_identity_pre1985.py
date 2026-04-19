@@ -255,6 +255,7 @@ async def main_async(args):
             base_urls=base_urls,
             model=(args.vllm_model or None),
             max_concurrency=per_server,
+            enable_thinking=args.vllm_enable_thinking,
         )
         effective_workers = max(args.workers, llm.num_backends * per_server)
         if effective_workers != args.workers:
@@ -334,6 +335,10 @@ def main():
                         help="Seconds to wait for /v1/models to respond on each vLLM server.")
     parser.add_argument("--per-server-workers", type=int, default=None,
                         help="In-flight requests per vLLM server. Falls back to --workers when unset.")
+    parser.add_argument("--vllm-enable-thinking", action="store_true", default=None,
+                        help="Pass chat_template_kwargs={enable_thinking: True} to vLLM "
+                             "(required for Gemma-4 / Qwen3 thinking mode). "
+                             "Defaults to $LOCAL_LLM_ENABLE_THINKING.")
     args = parser.parse_args()
     asyncio.run(main_async(args))
 

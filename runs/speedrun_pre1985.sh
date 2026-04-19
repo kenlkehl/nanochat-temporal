@@ -31,6 +31,8 @@
 #   VLLM_START_PORT=8000                     first port; each GPU gets start_port+i
 #   VLLM_EXTRA_ARGS="--max-model-len 8192"   passthrough flags to `vllm serve`
 #   VLLM_PER_SERVER_WORKERS=16               in-flight requests per server
+#   VLLM_ENABLE_THINKING=1                   forward chat_template_kwargs={enable_thinking: True}
+#                                            (required for Gemma-4 / Qwen3 thinking mode)
 #
 # Optional environment:
 #   DEPTH              — model depth (default 24); pick smaller if you have less compute
@@ -68,16 +70,21 @@ VLLM_GPUS="${VLLM_GPUS:-0}"
 VLLM_START_PORT="${VLLM_START_PORT:-8000}"
 VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
 VLLM_PER_SERVER_WORKERS="${VLLM_PER_SERVER_WORKERS:-16}"
+VLLM_ENABLE_THINKING="${VLLM_ENABLE_THINKING:-0}"
 
 VLLM_ARGS=()
 if [ "$VLLM_AUTO_LAUNCH" = "1" ]; then
-    VLLM_ARGS=(--vllm-auto-launch
-               --vllm-model "$VLLM_MODEL"
-               --vllm-gpus "$VLLM_GPUS"
-               --vllm-start-port "$VLLM_START_PORT"
-               --vllm-extra-args "$VLLM_EXTRA_ARGS"
-               --per-server-workers "$VLLM_PER_SERVER_WORKERS")
+    VLLM_ARGS+=(--vllm-auto-launch
+                --vllm-model "$VLLM_MODEL"
+                --vllm-gpus "$VLLM_GPUS"
+                --vllm-start-port "$VLLM_START_PORT"
+                --vllm-extra-args "$VLLM_EXTRA_ARGS"
+                --per-server-workers "$VLLM_PER_SERVER_WORKERS")
     echo "vLLM auto-launch: model=$VLLM_MODEL gpus=$VLLM_GPUS start_port=$VLLM_START_PORT per_server_workers=$VLLM_PER_SERVER_WORKERS"
+fi
+if [ "$VLLM_ENABLE_THINKING" = "1" ]; then
+    VLLM_ARGS+=(--vllm-enable-thinking)
+    echo "vLLM enable_thinking: on"
 fi
 
 if [ "${ANTHROPIC_BACKEND:-api}" = "vertex" ]; then

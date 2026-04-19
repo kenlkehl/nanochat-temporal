@@ -72,6 +72,9 @@ export OPENAI_BASE_URL=http://localhost:8000/v1   # single endpoint
 # OR, for load-balancing across a pool of already-running vLLM servers:
 # export OPENAI_BASE_URLS=http://localhost:8000/v1,http://localhost:8001/v1,http://localhost:8002/v1,http://localhost:8003/v1
 export LOCAL_LLM_MODEL=google/gemma-4-31b-it  # whatever your server hosts
+# Gemma-4 / Qwen3 need the thinking mode turned on in the chat template —
+# enable it on every request:
+export LOCAL_LLM_ENABLE_THINKING=1
 
 # --- Run config ---
 export DEPTH=24                                   # model depth (override as desired)
@@ -118,7 +121,9 @@ python -m scripts.build_sft_data \
     --vllm-auto-launch --vllm-gpus 0,1,2,3 --per-server-workers 16
 ```
 
-Generator CLI args: `--vllm-auto-launch`, `--vllm-model`, `--vllm-gpus`, `--vllm-start-port` (default 8000), `--vllm-extra-args`, `--vllm-startup-timeout` (default 600s), `--per-server-workers`.
+Generator CLI args: `--vllm-auto-launch`, `--vllm-model`, `--vllm-gpus`, `--vllm-start-port` (default 8000), `--vllm-extra-args`, `--vllm-startup-timeout` (default 600s), `--per-server-workers`, `--vllm-enable-thinking`.
+
+**Gemma-4 / Qwen3 thinking mode.** These models require `enable_thinking=True` to be passed through the chat template, otherwise they emit malformed output. The pipeline sends this as `chat_template_kwargs={"enable_thinking": True}` in the request body (vLLM forwards it to `tokenizer.apply_chat_template`). Turn it on with `VLLM_ENABLE_THINKING=1` (speedrun), `--vllm-enable-thinking` (CLI), or `LOCAL_LLM_ENABLE_THINKING=1` (env). The response's thinking prefix (`<think>...</think>` or `<start_of_thinking>...<end_of_thinking>`) is stripped automatically; if you've also configured vLLM with `--reasoning-parser gemma4` (pass via `VLLM_EXTRA_ARGS`), the server does the stripping and the client-side stripper is a harmless no-op.
 
 **Manual pool (share one set of servers across both stages to avoid paying the model-load cost twice):**
 
