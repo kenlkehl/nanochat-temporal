@@ -101,7 +101,7 @@ Stages 4 and 5 are the bottleneck on multi-GPU boxes when only one vLLM server i
 ```bash
 export VLLM_AUTO_LAUNCH=1
 export VLLM_MODEL=Qwen/Qwen3-32B-Instruct       # falls back to $LOCAL_LLM_MODEL
-export VLLM_GPUS="0,1,2,3"                       # supports "0-3" ranges too
+export VLLM_GPUS="0,1,2,3,4,5,6,7"                       # supports "0-3" ranges too
 export VLLM_PER_SERVER_WORKERS=16                # in-flight requests per server
 # Optional passthrough to `vllm serve`:
 export VLLM_EXTRA_ARGS="--max-model-len 8192 --gpu-memory-utilization 0.9"
