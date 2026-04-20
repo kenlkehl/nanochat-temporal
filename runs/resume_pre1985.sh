@@ -28,10 +28,7 @@ export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 export NANOCHAT_DATASET="pre1985"
 mkdir -p "$NANOCHAT_BASE_DIR"
 
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-[ -d ".venv" ] || uv venv
-uv sync --extra gpu
-source .venv/bin/activate
+
 
 # vllm sanity check (the original crash reason)
 python -c "import vllm, packaging.version as v; assert v.parse(vllm.__version__) >= v.parse('0.19.1'), f'need vllm>=0.19.1, have {vllm.__version__}'; print(f'vllm {vllm.__version__} OK')"
