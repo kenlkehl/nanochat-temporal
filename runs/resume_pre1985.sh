@@ -81,23 +81,23 @@ echo "Found pretrained checkpoint(s) under $NANOCHAT_BASE_DIR/base_checkpoints/"
 
 # -----------------------------------------------------------------------------
 # 4) Generate identity conversations
-echo "=========================================================================="
-echo "4) Generating identity conversations"
-echo "=========================================================================="
-python -m dev.gen_identity_pre1985 --num=200 --workers=8 "${VLLM_ARGS[@]}"
+# echo "=========================================================================="
+# echo "4) Generating identity conversations"
+# echo "=========================================================================="
+# python -m dev.gen_identity_pre1985 --num=200 --workers=8 "${VLLM_ARGS[@]}"
 
-# -----------------------------------------------------------------------------
-# 5) Generate bulk SFT data (resumable)
-echo "=========================================================================="
-echo "5) Generating SFT data (resumable)"
-echo "=========================================================================="
-python -m scripts.build_sft_data \
-    --grounded-qa "$GROUNDED_QA_N" \
-    --code "$CODE_N" \
-    --tool-use "$TOOL_USE_N" \
-    --comprehension "$COMPREHENSION_N" \
-    --workers 16 \
-    "${VLLM_ARGS[@]}"
+# # -----------------------------------------------------------------------------
+# # 5) Generate bulk SFT data (resumable)
+# echo "=========================================================================="
+# echo "5) Generating SFT data (resumable)"
+# echo "=========================================================================="
+# python -m scripts.build_sft_data \
+#     --grounded-qa "$GROUNDED_QA_N" \
+#     --code "$CODE_N" \
+#     --tool-use "$TOOL_USE_N" \
+#     --comprehension "$COMPREHENSION_N" \
+#     --workers 16 \
+#     "${VLLM_ARGS[@]}"
 
 # -----------------------------------------------------------------------------
 # 6) SFT
