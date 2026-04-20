@@ -8,7 +8,7 @@ pass to LocalLLM(...) explicitly:
     OPENAI_BASE_URL=http://localhost:8000/v1   # single endpoint
     OPENAI_BASE_URLS=http://h0:8000/v1,http://h0:8001/v1,...  # pool (comma-separated)
     OPENAI_API_KEY=EMPTY                        # whatever the local server expects
-    LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct     # model name the server exposes
+    LOCAL_LLM_MODEL=google/gemma-4-31B-it       # model name the server exposes
     LOCAL_LLM_ENABLE_THINKING=1                 # forward chat_template_kwargs={"enable_thinking": True}
                                                 # (needed for Gemma-4 / Qwen3 thinking mode)
 
@@ -71,6 +71,14 @@ def _strip_thinking(text: str) -> str:
     back to regex for common delimiters. Safe no-op when no delimiters are
     present (e.g. when the vLLM server already has --reasoning-parser enabled,
     which moves thinking into a separate `reasoning_content` field).
+
+    Why strip for this pipeline (pre-1985 SFT data gen): (1) the student model's
+    tokenizer has no special tokens for <|channel>/<|think|>, so keeping them
+    would teach it to emit literal delimiters it can't close; (2) contamination
+    control — CoT often references post-cutoff knowledge even when the final
+    answer is clean, and leaving it in the assistant string both confuses the
+    Claude filter and risks leaking modern facts into the student; (3) the
+    thinking is Gemma-4 scratch work, not training signal we want to imitate.
     """
     if not text:
         return text
@@ -116,7 +124,7 @@ class LocalLLM:
     ):
         self.base_urls = _resolve_base_urls(base_urls, base_url)
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "EMPTY")
-        self.model = model or os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen3-32B-Instruct")
+        self.model = model or os.environ.get("LOCAL_LLM_MODEL", "google/gemma-4-31B-it")
         self.max_concurrency = max_concurrency
         self.timeout = timeout
         # enable_thinking: when True, pass chat_template_kwargs={"enable_thinking": True}

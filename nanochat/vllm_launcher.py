@@ -9,7 +9,7 @@ Typical use::
 
     from nanochat.vllm_launcher import VLLMPool
 
-    with VLLMPool(model="Qwen/Qwen3-32B-Instruct", gpu_ids=[0, 1, 2, 3]) as pool:
+    with VLLMPool(model="google/gemma-4-31B-it", gpu_ids=[0, 1, 2, 3]) as pool:
         urls = pool.base_urls       # ["http://127.0.0.1:8000/v1", ...]
         # ... use urls with LocalLLM(base_urls=urls) ...
 """

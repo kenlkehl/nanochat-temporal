@@ -14,7 +14,7 @@ Requires:
     OPENAI_BASE_URL=http://localhost:8000/v1   (or wherever the local LLM is served)
       -or-
     OPENAI_BASE_URLS=http://h0:8000/v1,http://h0:8001/v1,...   (round-robin pool)
-    LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct    (or whatever model the server hosts)
+    LOCAL_LLM_MODEL=google/gemma-4-31B-it      (or whatever model the server hosts)
     ANTHROPIC_API_KEY=sk-ant-...                (for the contamination filter)
 
 Usage (single server):

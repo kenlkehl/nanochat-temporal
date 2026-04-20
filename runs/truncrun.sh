@@ -108,38 +108,6 @@ if [ "$VLLM_AUTO_LAUNCH" != "1" ] && [ -z "$OPENAI_BASE_URL" ] && [ -z "$OPENAI_
     echo "         SFT data generation will default to http://localhost:8000/v1."
 fi
 
-python -m nanochat.report reset
-
-# -----------------------------------------------------------------------------
-# 1) Build pre-1985 pretraining corpus (CPU, multi-hour, idempotent)
-echo "=========================================================================="
-echo "1) Building pre-1985 pretraining corpus (target ~${TARGET_TOKENS} tokens)"
-echo "=========================================================================="
-python -m scripts.build_pretrain_corpus \
-    --target-tokens "$TARGET_TOKENS" \
-    --mix "books_ia:0.55,books_loc:0.10,books_gutenberg:0.05,pubmed:0.30"
-
-# -----------------------------------------------------------------------------
-# 2) Train tokenizer on the new corpus
-echo "=========================================================================="
-echo "2) Training tokenizer on pre-1985 corpus"
-echo "=========================================================================="
-python -m scripts.tok_train
-python -m scripts.tok_eval
-
-# -----------------------------------------------------------------------------
-# 3) Pretrain (uses unmodified base_train.py — picks up corpus via NANOCHAT_DATASET)
-echo "=========================================================================="
-echo "3) Pretraining (depth=$DEPTH)"
-echo "=========================================================================="
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
-    --depth="$DEPTH" \
-    --device-batch-size=16 \
-    --fp8 \
-    --run="$WANDB_RUN"
-
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
-
 # -----------------------------------------------------------------------------
 # 4) Generate identity conversations (~$5 in Claude calls, ~30 min)
 echo "=========================================================================="

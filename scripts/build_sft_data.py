@@ -24,14 +24,14 @@ Output JSONL formats:
 
 Usage (single vLLM server, as before):
     OPENAI_BASE_URL=http://localhost:8000/v1 \\
-    LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct \\
+    LOCAL_LLM_MODEL=google/gemma-4-31B-it \\
     ANTHROPIC_API_KEY=sk-ant-... \\
     python -m scripts.build_sft_data \\
         --grounded-qa 20000 --code 10000 --tool-use 5000 --comprehension 5000 \\
         --workers 16
 
 Usage (auto-launch one vLLM server per GPU):
-    LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct \\
+    LOCAL_LLM_MODEL=google/gemma-4-31B-it \\
     ANTHROPIC_API_KEY=sk-ant-... \\
     python -m scripts.build_sft_data \\
         --grounded-qa 20000 --code 10000 --tool-use 5000 --comprehension 5000 \\
@@ -39,7 +39,7 @@ Usage (auto-launch one vLLM server per GPU):
 
 Usage (pool already running on multiple ports):
     OPENAI_BASE_URLS=http://localhost:8000/v1,http://localhost:8001/v1 \\
-    LOCAL_LLM_MODEL=Qwen/Qwen3-32B-Instruct \\
+    LOCAL_LLM_MODEL=google/gemma-4-31B-it \\
     python -m scripts.build_sft_data ... --per-server-workers 16
 """
 
