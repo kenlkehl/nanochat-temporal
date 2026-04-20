@@ -77,7 +77,7 @@ def _strip_thinking(text: str) -> str:
     would teach it to emit literal delimiters it can't close; (2) contamination
     control — CoT often references post-cutoff knowledge even when the final
     answer is clean, and leaving it in the assistant string both confuses the
-    Claude filter and risks leaking modern facts into the student; (3) the
+    local-LLM filter and risks leaking modern facts into the student; (3) the
     thinking is Gemma-4 scratch work, not training signal we want to imitate.
     """
     if not text:
@@ -164,7 +164,9 @@ class LocalLLM:
         temperature=0.9,
         response_format=None,
         max_attempts=5,
+        enable_thinking: Optional[bool] = None,
     ):
+        use_thinking = self.enable_thinking if enable_thinking is None else bool(enable_thinking)
         last_exc = None
         last_url = None
         for attempt in range(1, max_attempts + 1):
@@ -180,7 +182,7 @@ class LocalLLM:
                     )
                     if response_format is not None:
                         kwargs["response_format"] = response_format
-                    if self.enable_thinking:
+                    if use_thinking:
                         # vLLM forwards chat_template_kwargs through to
                         # tokenizer.apply_chat_template(); openai SDK hides any
                         # non-standard keys in `extra_body`.
@@ -189,7 +191,7 @@ class LocalLLM:
                         }
                     response = await client.chat.completions.create(**kwargs)
                 content = response.choices[0].message.content or ""
-                if self.enable_thinking:
+                if use_thinking:
                     content = _strip_thinking(content)
                 return content
             except (

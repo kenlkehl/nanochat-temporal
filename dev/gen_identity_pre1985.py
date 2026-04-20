@@ -4,8 +4,8 @@ Generate synthetic identity conversations for the Fluttering Pebble persona.
 Forked from dev/gen_synthetic_data.py with these changes:
 - Persona: pre-1985 contamination-controlled assistant (see knowledge/fluttering_pebble.md)
 - Generator: local OpenAI-compatible LLM (vLLM/SGLang/etc.) instead of OpenRouter
-- Each generated conversation is run through the Claude-based contamination filter;
-  UNSAFE/UNSURE rejections are dropped.
+- Each generated conversation is also judged by the same local LLM as a
+  contamination filter; UNSAFE/UNSURE rejections are dropped.
 
 Output JSONL has one conversation per line in the format expected by tasks/customjson.py:
     [{"role":"user","content":"..."},{"role":"assistant","content":"..."}, ...]
@@ -15,7 +15,6 @@ Requires:
       -or-
     OPENAI_BASE_URLS=http://h0:8000/v1,http://h0:8001/v1,...   (round-robin pool)
     LOCAL_LLM_MODEL=google/gemma-4-31B-it      (or whatever model the server hosts)
-    ANTHROPIC_API_KEY=sk-ant-...                (for the contamination filter)
 
 Usage (single server):
     python -m dev.gen_identity_pre1985 --num 200 --workers 8
@@ -264,7 +263,7 @@ async def main_async(args):
                 f"{effective_workers} to saturate {llm.num_backends} backend(s) "
                 f"at {per_server} req/server."
             )
-        cf = ContaminationFilter(max_concurrency=effective_workers)
+        cf = ContaminationFilter(llm=llm, max_concurrency=effective_workers)
 
         out_path = args.output or os.path.join(get_base_dir(), "sft_data_pre1985", "identity_pre1985.jsonl")
         os.makedirs(os.path.dirname(out_path), exist_ok=True)

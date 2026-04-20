@@ -1,45 +1,31 @@
 """
-Pre-1985 contamination filter using Anthropic Claude.
+Pre-1985 contamination filter using the local vLLM-served LLM.
 
-Cascade:
-1. Cheap rule-based prefilter (regex year + curated keyword list) — flags route to Sonnet.
-2. Haiku 4.5 — default judge for unflagged samples.
-3. Sonnet 4.6 — escalation for prefilter-flagged samples, Haiku-UNSURE cases,
-   and a random audit on Haiku-passed samples (default 5%).
+Every candidate conversation is judged by the same OpenAI-compatible local
+server (e.g. vLLM serving google/gemma-4-31B-it) that the generator uses.
+A cheap regex prefilter still runs as a fast pre-check so flagged samples
+get logged, but there's no cheap-vs-strong routing — one model judges all.
 
-Verdicts are cached in an aiosqlite DB keyed on sha256 of the conversation JSON,
-so reruns are free and the SFT data builder is fully resumable.
-
-Backends (set ANTHROPIC_BACKEND or pass `backend=...`):
-  - "api"    — public Anthropic API. Requires ANTHROPIC_API_KEY.
-  - "vertex" — Google Cloud Vertex AI. Requires Google ADC
-               (gcloud auth application-default login, GOOGLE_APPLICATION_CREDENTIALS,
-               or GCP metadata server) plus ANTHROPIC_VERTEX_PROJECT_ID and
-               ANTHROPIC_VERTEX_REGION (or CLOUD_ML_REGION).
-
-Per-backend default model IDs can be overridden via ANTHROPIC_HAIKU_MODEL /
-ANTHROPIC_SONNET_MODEL env vars or constructor args. Vertex sometimes requires
-an "@<release-date>" suffix in the model ID; defaults are sensible but version-
-sensitive — override if your Vertex deployment uses a different convention.
+Verdicts are cached in an aiosqlite DB keyed on sha256 of the conversation
+JSON, so reruns are free and the SFT data builder is fully resumable. Old
+Claude-era verdicts stay valid; semantics are identical.
 
 Usage:
 
     import asyncio
+    from nanochat.sft_generator import LocalLLM
     from nanochat.contamination_filter import ContaminationFilter
 
     async def main():
-        # Public API:
-        cf = ContaminationFilter()
-        # Or Vertex:
-        # cf = ContaminationFilter(backend="vertex",
-        #                          vertex_project_id="my-gcp-project",
-        #                          vertex_region="us-east5")
+        llm = LocalLLM()
+        cf = ContaminationFilter(llm=llm)
         safe, reason = await cf.check([
             {"role": "user", "content": "What is PCR?"},
             {"role": "assistant", "content": "PCR is polymerase chain reaction..."},
         ])
         print(safe, reason)
         await cf.close()
+        await llm.close()
 
     asyncio.run(main())
 """
@@ -51,30 +37,18 @@ import re
 import json
 import asyncio
 import hashlib
-import random
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import aiosqlite
-import anthropic
-from anthropic import AsyncAnthropic
 
-# Default model IDs.
-#
-# - Anthropic API ("api" backend): per-system info, Haiku 4.5 = "claude-haiku-4-5-20251001",
-#   Sonnet 4.6 = "claude-sonnet-4-6".
-# - Vertex backend: Vertex sometimes requires an "@<release-date>" suffix in the model ID
-#   (e.g. "claude-haiku-4-5@20251001"). If your Vertex deployment needs that form, override
-#   via the ANTHROPIC_HAIKU_MODEL / ANTHROPIC_SONNET_MODEL env vars or the haiku_model /
-#   sonnet_model constructor args.
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
-SONNET_MODEL = "claude-sonnet-4-6"
-VERTEX_HAIKU_MODEL = "claude-haiku-4-5@20251001"
-VERTEX_SONNET_MODEL = "claude-sonnet-4-6"
+if TYPE_CHECKING:
+    from nanochat.sft_generator import LocalLLM
 
 # Years 1985-2199 — anything in this range outside code is suspicious
 YEAR_REGEX = re.compile(r"\b(?:198[5-9]|199\d|20\d{2}|21\d{2})\b")
 
-# Curated post-1985 indicators. Hits don't auto-reject — they route to Sonnet.
+# Curated post-1985 indicators. Hits don't auto-reject — they're noted in the
+# cached reason so failures are easier to audit.
 POST_1985_KEYWORDS = [
     # Tech products / companies founded post-1984
     "iPhone", "iPad", "Android", "smartphone", "smart phone",
@@ -148,7 +122,7 @@ def _format_conversation(conversation):
 
 def cheap_prefilter(conversation):
     """Return True if the conversation contains a year 1985+ outside code blocks
-    or any post-1985 keyword. Doesn't auto-reject — flagged samples route to Sonnet."""
+    or any post-1985 keyword. Informational only — doesn't auto-reject."""
     text = _format_conversation(conversation)
     text_no_code = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
     text_no_code = re.sub(r"`[^`]*`", " ", text_no_code)
@@ -172,70 +146,17 @@ def parse_verdict(response_text):
 class ContaminationFilter:
     def __init__(
         self,
+        llm: "LocalLLM",
         cache_path: Optional[str] = None,
         max_concurrency: int = 20,
-        sonnet_audit_rate: float = 0.05,
-        # Anthropic API auth (api backend)
-        api_key: Optional[str] = None,
-        # Backend selection
-        backend: Optional[str] = None,            # "api" (default) | "vertex"
-        # Model overrides (per-backend defaults if not set)
-        haiku_model: Optional[str] = None,
-        sonnet_model: Optional[str] = None,
-        # Vertex-specific config (only used when backend == "vertex")
-        vertex_project_id: Optional[str] = None,
-        vertex_region: Optional[str] = None,
     ):
         from nanochat.common import get_base_dir
+        self.llm = llm
         self.cache_path = cache_path or os.path.join(get_base_dir(), "contam_cache.sqlite")
         os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
         self.semaphore = asyncio.Semaphore(max_concurrency)
-        self.sonnet_audit_rate = sonnet_audit_rate
         self._db = None
         self._db_lock = asyncio.Lock()
-        self._audit_rng = random.Random(20260419)
-
-        # Resolve backend
-        backend = (backend or os.environ.get("ANTHROPIC_BACKEND") or "api").lower()
-        if backend not in ("api", "vertex"):
-            raise ValueError(f"Unknown backend {backend!r} (valid: 'api', 'vertex')")
-        self.backend = backend
-
-        # Resolve model IDs (env override > per-backend default)
-        env_haiku = os.environ.get("ANTHROPIC_HAIKU_MODEL")
-        env_sonnet = os.environ.get("ANTHROPIC_SONNET_MODEL")
-        if backend == "vertex":
-            self.haiku_model = haiku_model or env_haiku or VERTEX_HAIKU_MODEL
-            self.sonnet_model = sonnet_model or env_sonnet or VERTEX_SONNET_MODEL
-        else:
-            self.haiku_model = haiku_model or env_haiku or HAIKU_MODEL
-            self.sonnet_model = sonnet_model or env_sonnet or SONNET_MODEL
-
-        # Build the client
-        if backend == "vertex":
-            from anthropic import AsyncAnthropicVertex
-            project_id = (
-                vertex_project_id
-                or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
-                or os.environ.get("CLOUD_ML_PROJECT_ID")
-                or os.environ.get("GOOGLE_CLOUD_PROJECT")
-            )
-            region = (
-                vertex_region
-                or os.environ.get("ANTHROPIC_VERTEX_REGION")
-                or os.environ.get("CLOUD_ML_REGION")
-            )
-            kwargs = {}
-            if project_id:
-                kwargs["project_id"] = project_id
-            if region:
-                kwargs["region"] = region
-            # Auth is handled by google-auth (ADC, GOOGLE_APPLICATION_CREDENTIALS,
-            # gcloud auth application-default login, or GCP metadata server).
-            self.client = AsyncAnthropicVertex(**kwargs)
-        else:
-            client_kwargs = {"api_key": api_key} if api_key else {}
-            self.client = AsyncAnthropic(**client_kwargs)
 
     async def _get_db(self):
         if self._db is None:
@@ -273,31 +194,18 @@ class ContaminationFilter:
         )
         await db.commit()
 
-    async def _call_claude(self, model, conversation_text, max_attempts=5):
-        last_exc = None
-        for attempt in range(1, max_attempts + 1):
-            try:
-                async with self.semaphore:
-                    response = await self.client.messages.create(
-                        model=model,
-                        max_tokens=200,
-                        system=SYSTEM_PROMPT,
-                        messages=[
-                            {"role": "user", "content": f"CANDIDATE CONVERSATION:\n\n{conversation_text}"}
-                        ],
-                    )
-                if response.content:
-                    return response.content[0].text
-                return ""
-            except (anthropic.APIConnectionError, anthropic.APIStatusError, asyncio.TimeoutError) as e:
-                last_exc = e
-                if attempt == max_attempts:
-                    raise
-                wait = min(2 ** attempt, 60)
-                await asyncio.sleep(wait)
-        if last_exc:
-            raise last_exc
-        return ""
+    async def _call_judge(self, conversation_text):
+        async with self.semaphore:
+            return await self.llm.chat(
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",
+                     "content": f"CANDIDATE CONVERSATION:\n\n{conversation_text}"},
+                ],
+                max_tokens=300,
+                temperature=0.0,
+                enable_thinking=False,
+            )
 
     async def check(self, conversation):
         """
@@ -311,32 +219,16 @@ class ContaminationFilter:
         if cached is not None:
             return cached[0], cached[2]
 
-        flagged = cheap_prefilter(conversation)
         text = _format_conversation(conversation)
-
-        if flagged:
-            response_text = await self._call_claude(self.sonnet_model, text)
-            verdict = parse_verdict(response_text)
-            model_used = self.sonnet_model
-        else:
-            response_text = await self._call_claude(self.haiku_model, text)
-            verdict = parse_verdict(response_text)
-            model_used = self.haiku_model
-            if verdict == "UNSURE":
-                response_text = await self._call_claude(self.sonnet_model, text)
-                verdict = parse_verdict(response_text)
-                model_used = self.sonnet_model
-            elif verdict == "SAFE" and self._audit_rng.random() < self.sonnet_audit_rate:
-                audit_text = await self._call_claude(self.sonnet_model, text)
-                audit_verdict = parse_verdict(audit_text)
-                if audit_verdict == "UNSAFE":
-                    verdict = "UNSAFE"
-                    response_text = audit_text
-                    model_used = f"{self.haiku_model}+audit:{self.sonnet_model}"
+        response_text = await self._call_judge(text)
+        verdict = parse_verdict(response_text)
 
         safe = verdict == "SAFE"  # UNSURE conservatively counts as unsafe
-        await self._cache_put(key, safe, verdict, response_text.strip(), model_used)
-        return safe, response_text.strip()
+        reason = response_text.strip()
+        if cheap_prefilter(conversation):
+            reason = "[prefilter:flagged] " + reason
+        await self._cache_put(key, safe, verdict, reason, self.llm.model)
+        return safe, reason
 
     async def close(self):
         if self._db is not None:

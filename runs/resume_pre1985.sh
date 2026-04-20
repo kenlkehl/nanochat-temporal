@@ -11,7 +11,6 @@
 #
 # Env knobs (all optional, all inherit the speedrun_pre1985.sh defaults except
 # VLLM_AUTO_LAUNCH which defaults ON here):
-#   ANTHROPIC_API_KEY         (or ANTHROPIC_BACKEND=vertex + VERTEX vars)
 #   VLLM_AUTO_LAUNCH=1        default ON (set =0 if you already have a server)
 #   VLLM_MODEL                default google/gemma-4-31B-it
 #   VLLM_GPUS                 default "0" (one server per GPU); set e.g. "0,1,2,3"
@@ -62,19 +61,6 @@ fi
 if [ "$VLLM_ENABLE_THINKING" = "1" ]; then
     VLLM_ARGS+=(--vllm-enable-thinking)
     echo "vLLM enable_thinking: on"
-fi
-
-if [ "${ANTHROPIC_BACKEND:-api}" = "vertex" ]; then
-    if [ -z "$ANTHROPIC_VERTEX_PROJECT_ID" ]; then
-        echo "ERROR: ANTHROPIC_BACKEND=vertex requires ANTHROPIC_VERTEX_PROJECT_ID."
-        exit 1
-    fi
-    echo "Anthropic backend: Vertex (project=$ANTHROPIC_VERTEX_PROJECT_ID region=${ANTHROPIC_VERTEX_REGION:-unset})"
-elif [ -z "$ANTHROPIC_API_KEY" ]; then
-    echo "ERROR: ANTHROPIC_API_KEY is not set (or set ANTHROPIC_BACKEND=vertex with project/region)."
-    exit 1
-else
-    echo "Anthropic backend: public API"
 fi
 
 # Confirm the pretrained base checkpoint is actually on disk — otherwise step 3

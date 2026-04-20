@@ -4,9 +4,9 @@ scripts/build_sft_data.py
 Async orchestrator for SFT synthetic data generation.
 
 For each category, fires N candidate generations through the local LLM, runs each
-through the Claude-based contamination filter, drops UNSAFE/UNSURE rejections,
-and writes survivors to a per-category JSONL. Resumable via per-category
-progress sidecar files (`*.progress.json`).
+through the local-LLM contamination filter (same server, thinking disabled, temp=0),
+drops UNSAFE/UNSURE rejections, and writes survivors to a per-category JSONL.
+Resumable via per-category progress sidecar files (`*.progress.json`).
 
 Categories:
   - grounded_qa:    Q&A grounded in random passages from the pre-1985 corpus shards.
@@ -25,14 +25,12 @@ Output JSONL formats:
 Usage (single vLLM server, as before):
     OPENAI_BASE_URL=http://localhost:8000/v1 \\
     LOCAL_LLM_MODEL=google/gemma-4-31B-it \\
-    ANTHROPIC_API_KEY=sk-ant-... \\
     python -m scripts.build_sft_data \\
         --grounded-qa 20000 --code 10000 --tool-use 5000 --comprehension 5000 \\
         --workers 16
 
 Usage (auto-launch one vLLM server per GPU):
     LOCAL_LLM_MODEL=google/gemma-4-31B-it \\
-    ANTHROPIC_API_KEY=sk-ant-... \\
     python -m scripts.build_sft_data \\
         --grounded-qa 20000 --code 10000 --tool-use 5000 --comprehension 5000 \\
         --vllm-auto-launch --vllm-gpus 0,1,2,3 --per-server-workers 16
@@ -402,10 +400,13 @@ async def run_category(category, target, output_dir, sampler, llm, cf, workers, 
     completed = set(progress["completed_indices"])
 
     fn = CATEGORY_REGISTRY[category]
+    first_filter_err_printed = False
+    consecutive_filter_errs = 0
     sem = asyncio.Semaphore(workers)
     state_lock = asyncio.Lock()
 
     async def worker(idx):
+        nonlocal first_filter_err_printed, consecutive_filter_errs
         async with sem:
             messages, err = await fn(idx, sampler, llm, cf)
         async with state_lock:
@@ -414,10 +415,25 @@ async def run_category(category, target, output_dir, sampler, llm, cf, workers, 
                     f.write(json.dumps(messages, ensure_ascii=False) + "\n")
                 progress["accepted"] += 1
                 tag = "OK"
+                consecutive_filter_errs = 0
             else:
                 if err and ("gen err" in err or "filter err" in err):
                     progress["errors"] += 1
                     tag = "ERR"
+                    if err and "filter err" in err:
+                        consecutive_filter_errs += 1
+                        if not first_filter_err_printed:
+                            first_filter_err_printed = True
+                            print(
+                                f"\n[{category}] First filter error (full text):\n{err}\n"
+                                "Usually means the local vLLM server is unreachable or has crashed.\n",
+                                flush=True,
+                            )
+                        if consecutive_filter_errs >= 20:
+                            raise SystemExit(
+                                f"[{category}] Aborting: {consecutive_filter_errs} consecutive filter "
+                                f"errors. Check the local vLLM server and rerun (progress is saved)."
+                            )
                 else:
                     progress["rejected"] += 1
                     tag = "DROP"
@@ -426,10 +442,15 @@ async def run_category(category, target, output_dir, sampler, llm, cf, workers, 
             if done % 25 == 0 or tag != "OK":
                 with open(progress_path, "w") as f:
                     json.dump(progress, f)
+            err_slice = (err or "").replace("\n", " ")
+            if tag == "ERR":
+                err_slice = err_slice[:300]
+            else:
+                err_slice = err_slice[:80]
             print(
                 f"[{category}] [{done}/{target}] {tag:4s} "
                 f"acc={progress['accepted']} rej={progress['rejected']} err={progress['errors']}  "
-                f"{(err or '')[:80]}"
+                f"{err_slice}"
             )
 
     indices = list(range(base_idx_offset, base_idx_offset + target))
@@ -487,7 +508,7 @@ async def main_async(args):
                 f"{effective_workers} to saturate {llm.num_backends} backend(s) "
                 f"at {per_server} req/server."
             )
-        cf = ContaminationFilter(max_concurrency=effective_workers)
+        cf = ContaminationFilter(llm=llm, max_concurrency=effective_workers)
 
         targets = {
             "grounded_qa":  args.grounded_qa,
