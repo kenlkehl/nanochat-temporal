@@ -270,6 +270,8 @@ The "python" expression should be SHORT (one line, evaluable with eval()). The "
 def validate_plain_pair(messages):
     if not isinstance(messages, list) or len(messages) != 2:
         return False
+    if not all(isinstance(m, dict) for m in messages):
+        return False
     if messages[0].get("role") != "user" or messages[1].get("role") != "assistant":
         return False
     for m in messages:
@@ -439,9 +441,8 @@ async def run_category(category, target, output_dir, sampler, llm, cf, workers, 
                     tag = "DROP"
             progress["completed_indices"].append(idx)
             done = len(progress["completed_indices"])
-            if done % 25 == 0 or tag != "OK":
-                with open(progress_path, "w") as f:
-                    json.dump(progress, f)
+            with open(progress_path, "w") as f:
+                json.dump(progress, f)
             err_slice = (err or "").replace("\n", " ")
             if tag == "ERR":
                 err_slice = err_slice[:300]
