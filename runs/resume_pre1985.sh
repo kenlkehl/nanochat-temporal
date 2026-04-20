@@ -88,10 +88,10 @@ echo "Found pretrained checkpoint(s) under $NANOCHAT_BASE_DIR/base_checkpoints/"
 
 # -----------------------------------------------------------------------------
 # 3b) Base eval (cheap, idempotent — safe to re-run)
-echo "=========================================================================="
-echo "3b) Base eval"
-echo "=========================================================================="
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+# echo "=========================================================================="
+# echo "3b) Base eval"
+# echo "=========================================================================="
+# torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
 
 # -----------------------------------------------------------------------------
 # 4) Generate identity conversations
