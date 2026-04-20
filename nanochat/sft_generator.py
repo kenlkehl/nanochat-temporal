@@ -160,7 +160,7 @@ class LocalLLM:
     async def chat(
         self,
         messages,
-        max_tokens=2048,
+        max_tokens=20000,
         temperature=0.9,
         response_format=None,
         max_attempts=5,
@@ -213,17 +213,58 @@ class LocalLLM:
         _ = last_url
         return ""
 
-    async def chat_json(self, messages, **kwargs):
-        """Like chat but parses the response as JSON. Strips markdown code fences if present."""
-        text = await self.chat(messages, **kwargs)
-        text = text.strip()
-        if text.startswith("```"):
-            # ```json\n...\n``` or ```\n...\n```
-            text = text.split("\n", 1)[1] if "\n" in text else text
-            if text.endswith("```"):
-                text = text.rsplit("```", 1)[0]
-            text = text.strip()
-        return json.loads(text)
+    async def chat_json(self, messages, max_parse_attempts=3, **kwargs):
+        """Like chat but parses the response as JSON. Strips markdown code fences.
+
+        On JSON parse failure, re-prompts the model with its own failing output
+        appended as an assistant turn plus a user "repair" turn quoting the
+        parse error, up to max_parse_attempts times. Useful because enable_thinking
+        occasionally leaks prose/markdown alongside the JSON payload even when
+        response_format={"type": "json_object"} is set.
+        """
+        conversation = list(messages)
+        last_text = ""
+        last_exc: Optional[json.JSONDecodeError] = None
+        for attempt in range(1, max_parse_attempts + 1):
+            text = await self.chat(conversation, **kwargs)
+            last_text = text
+            stripped = text.strip()
+            if stripped.startswith("```"):
+                stripped = stripped.split("\n", 1)[1] if "\n" in stripped else stripped
+                if stripped.endswith("```"):
+                    stripped = stripped.rsplit("```", 1)[0]
+                stripped = stripped.strip()
+            try:
+                return json.loads(stripped)
+            except json.JSONDecodeError as e:
+                last_exc = e
+                if attempt == max_parse_attempts:
+                    break
+                print(
+                    f"[LocalLLM] chat_json parse failure "
+                    f"(attempt {attempt}/{max_parse_attempts}): {e.msg}. "
+                    f"Asking model to repair."
+                )
+                conversation = conversation + [
+                    {"role": "assistant", "content": text},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous response could not be parsed as JSON. "
+                            f"Parser error: {e.msg} (line {e.lineno}, col {e.colno}). "
+                            "Return a single valid JSON object only — no prose, "
+                            "no markdown fences, no commentary. Use the same "
+                            "schema the original instruction asked for."
+                        ),
+                    },
+                ]
+        excerpt = last_text[:500].replace("\n", " ")
+        raise json.JSONDecodeError(
+            f"Failed to parse JSON after {max_parse_attempts} attempts. "
+            f"Last output excerpt: {excerpt!r}",
+            last_text or "",
+            0,
+        ) from last_exc
 
     async def close(self) -> None:
         for c in self._clients:

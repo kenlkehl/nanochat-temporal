@@ -320,7 +320,7 @@ async def _generic_qa(category, prompt, llm, cf):
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.95,
-            max_tokens=1024,
+            max_tokens=20000,
         )
     except Exception as e:
         return None, f"gen err: {type(e).__name__}: {e}"
@@ -362,7 +362,7 @@ async def gen_tool_use(idx, sampler, llm, cf):
             messages=[{"role": "user", "content": TOOL_USE_PROMPT}],
             response_format={"type": "json_object"},
             temperature=1.0,
-            max_tokens=1024,
+            max_tokens=20000,
         )
     except Exception as e:
         return None, f"gen err: {type(e).__name__}: {e}"

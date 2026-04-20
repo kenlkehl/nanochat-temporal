@@ -205,7 +205,7 @@ async def generate_one(idx, knowledge, llm, cf):
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=1.0,
-            max_tokens=2048,
+            max_tokens=20000,
         )
     except Exception as e:
         return None, f"generation error: {type(e).__name__}: {e}", div
