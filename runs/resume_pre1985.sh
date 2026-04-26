@@ -63,41 +63,41 @@ if [ "$VLLM_ENABLE_THINKING" = "1" ]; then
     echo "vLLM enable_thinking: on"
 fi
 
-# Confirm the pretrained base checkpoint is actually on disk — otherwise step 3
-# didn't really finish and we should bail rather than silently retrain.
-if ! ls "$NANOCHAT_BASE_DIR"/base_checkpoints/*/model_*.pt >/dev/null 2>&1; then
-    echo "ERROR: no pretrained checkpoint found under $NANOCHAT_BASE_DIR/base_checkpoints/."
-    echo "       Run speedrun_pre1985.sh first to complete steps 1-3."
-    exit 1
-fi
-echo "Found pretrained checkpoint(s) under $NANOCHAT_BASE_DIR/base_checkpoints/"
+# # Confirm the pretrained base checkpoint is actually on disk — otherwise step 3
+# # didn't really finish and we should bail rather than silently retrain.
+# if ! ls "$NANOCHAT_BASE_DIR"/base_checkpoints/*/model_*.pt >/dev/null 2>&1; then
+#     echo "ERROR: no pretrained checkpoint found under $NANOCHAT_BASE_DIR/base_checkpoints/."
+#     echo "       Run speedrun_pre1985.sh first to complete steps 1-3."
+#     exit 1
+# fi
+# echo "Found pretrained checkpoint(s) under $NANOCHAT_BASE_DIR/base_checkpoints/"
 
-# -----------------------------------------------------------------------------
-# 3b) Base eval (cheap, idempotent — safe to re-run)
+# # -----------------------------------------------------------------------------
+# # 3b) Base eval (cheap, idempotent — safe to re-run)
+# # echo "=========================================================================="
+# # echo "3b) Base eval"
+# # echo "=========================================================================="
+# # torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+
+# # -----------------------------------------------------------------------------
+# # 4) Generate identity conversations
 # echo "=========================================================================="
-# echo "3b) Base eval"
+# echo "4) Generating identity conversations"
 # echo "=========================================================================="
-# torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+# python -m dev.gen_identity_pre1985 --num=200 --workers=8 "${VLLM_ARGS[@]}"
 
-# -----------------------------------------------------------------------------
-# 4) Generate identity conversations
-echo "=========================================================================="
-echo "4) Generating identity conversations"
-echo "=========================================================================="
-python -m dev.gen_identity_pre1985 --num=200 --workers=8 "${VLLM_ARGS[@]}"
-
-# -----------------------------------------------------------------------------
-# 5) Generate bulk SFT data (resumable)
-echo "=========================================================================="
-echo "5) Generating SFT data (resumable)"
-echo "=========================================================================="
-python -m scripts.build_sft_data \
-    --grounded-qa "$GROUNDED_QA_N" \
-    --code "$CODE_N" \
-    --tool-use "$TOOL_USE_N" \
-    --comprehension "$COMPREHENSION_N" \
-    --workers 16 \
-    "${VLLM_ARGS[@]}"
+# # -----------------------------------------------------------------------------
+# # 5) Generate bulk SFT data (resumable)
+# echo "=========================================================================="
+# echo "5) Generating SFT data (resumable)"
+# echo "=========================================================================="
+# python -m scripts.build_sft_data \
+#     --grounded-qa "$GROUNDED_QA_N" \
+#     --code "$CODE_N" \
+#     --tool-use "$TOOL_USE_N" \
+#     --comprehension "$COMPREHENSION_N" \
+#     --workers 16 \
+#     "${VLLM_ARGS[@]}"
 
 # -----------------------------------------------------------------------------
 # 6) SFT
@@ -105,7 +105,7 @@ echo "==========================================================================
 echo "6) Supervised fine-tuning"
 echo "=========================================================================="
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft_pre1985 -- \
-    --device-batch-size=16 \
+    --device-batch-size=8 \
     --chatcore-every=-1 \
     --run="$WANDB_RUN"
 
